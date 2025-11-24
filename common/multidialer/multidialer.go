@@ -670,26 +670,21 @@ func NewWSConn(c *websocket.Conn) *WSConn {
 }
 
 func (c *WSConn) Read(b []byte) (n int, err error) {
-	for {
-		if c.reader == nil {
-			var messageType int
-			messageType, c.reader, err = c.Conn.NextReader()
-			if err != nil {
-				return 0, err
-			}
-			// Skip non-binary messages (text, ping, pong are handled by handlers)
-			if messageType != websocket.BinaryMessage {
-				c.reader = nil
-				continue
-			}
+	if c.reader == nil {
+		// NextReader() automatically handles control frames (ping/pong) via the handlers we set
+		// It only returns data frames (binary or text), control frames are processed internally
+		_, c.reader, err = c.Conn.NextReader()
+		if err != nil {
+			return 0, err
 		}
-		n, err = c.reader.Read(b)
-		if err == io.EOF {
-			c.reader = nil
-			continue
-		}
-		return n, err
 	}
+	n, err = c.reader.Read(b)
+	if err == io.EOF {
+		c.reader = nil
+		// Recursively read the next message
+		return c.Read(b)
+	}
+	return n, err
 }
 
 func (c *WSConn) Write(b []byte) (n int, err error) {
