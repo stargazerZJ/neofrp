@@ -138,8 +138,8 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	tunnel := &Tunnel{
 		id:           tunnelID,
-		uploadChan:   make(chan []byte, 100),
-		downloadChan: make(chan []byte, 100),
+		uploadChan:   make(chan []byte, 4096),
+		downloadChan: make(chan []byte, 4096),
 		ctx:          ctx,
 		cancel:       cancel,
 	}
