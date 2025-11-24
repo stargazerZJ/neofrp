@@ -1,3 +1,8 @@
+config/
+frpc_ws.json
+frps_ws.json
+
+
 # Binaries for programs and plugins
 *.exe
 *.exe~
