@@ -144,7 +144,16 @@ func (p *ConnectionPool) handleTunnel(tunnel *Tunnel) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Error("Download stream failed", "status", resp.StatusCode, "tunnel_id", tunnel.id)
+		// Try to read error message from response body
+		errMsg := ""
+		if resp.Body != nil {
+			// Read up to 256B of error message
+			buf := make([]byte, 256)
+			if n, err := resp.Body.Read(buf); err == nil && n > 0 {
+				errMsg = string(buf[:n])
+			}
+		}
+		log.Error("Download stream failed", "status", resp.StatusCode, "tunnel_id", tunnel.id, "resp_body", errMsg)
 		return
 	}
 
