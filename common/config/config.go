@@ -24,11 +24,12 @@ type LogConfig struct {
 }
 
 type ClientTransportConfig struct {
-	Protocol   string `json:"protocol,omitempty"`    // "quic", "tcp", "ws", or "wss"
-	IP         string `json:"server_ip,omitempty"`   // Server IP
-	Port       int    `json:"server_port,omitempty"` // Server Port
-	CAFile     string `json:"ca_file,omitempty"`     // Path to CA file
-	ServerName string `json:"server_name,omitempty"` // SNI
+	Protocol    string `json:"protocol,omitempty"`     // "quic", "tcp", "ws", or "wss"
+	IP          string `json:"server_ip,omitempty"`    // Server IP
+	Port        int    `json:"server_port,omitempty"`  // Server Port
+	CAFile      string `json:"ca_file,omitempty"`      // Path to CA file
+	ServerName  string `json:"server_name,omitempty"`  // SNI
+	BearerToken string `json:"bearer_token,omitempty"` // Bearer token for WebSocket Authorization header
 }
 
 type ServerTransportConfig struct {

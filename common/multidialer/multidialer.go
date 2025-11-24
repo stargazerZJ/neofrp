@@ -53,7 +53,7 @@ type Session interface {
 
 // Dial connects to a remote address and returns a session.
 // protocol must be "tcp" or "quic".
-func Dial(ctx context.Context, protocol, address string, tlsConfig *tls.Config) (Session, error) {
+func Dial(ctx context.Context, protocol, address string, tlsConfig *tls.Config, bearerToken ...string) (Session, error) {
 	switch protocol {
 	case "tcp":
 		conn, err := tls.Dial("tcp", address, tlsConfig)
@@ -70,7 +70,13 @@ func Dial(ctx context.Context, protocol, address string, tlsConfig *tls.Config) 
 		dialer := websocket.Dialer{
 			TLSClientConfig: tlsConfig,
 		}
-		c, _, err := dialer.DialContext(ctx, u, nil)
+		// Add Authorization header if bearer token is provided
+		var headers http.Header
+		if len(bearerToken) > 0 && bearerToken[0] != "" {
+			headers = http.Header{}
+			headers.Set("Authorization", fmt.Sprintf("Bearer %s", bearerToken[0]))
+		}
+		c, _, err := dialer.DialContext(ctx, u, headers)
 		if err != nil {
 			return nil, err
 		}

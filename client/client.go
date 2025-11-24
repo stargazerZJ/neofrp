@@ -37,6 +37,7 @@ func Run(config *config.ClientConfig) {
 		config.TransportConfig.Protocol,
 		net.JoinHostPort(config.TransportConfig.IP, fmt.Sprintf("%d", config.TransportConfig.Port)),
 		tlsConfig,
+		config.TransportConfig.BearerToken,
 	)
 	if err != nil {
 		log.Errorf("Failed to connect to server: %v", err)
