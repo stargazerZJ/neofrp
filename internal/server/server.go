@@ -13,33 +13,37 @@ import (
 	"neofrp/internal/config"
 
 	"github.com/charmbracelet/log"
-	"github.com/gorilla/websocket"
 )
 
 type Server struct {
 	cfg        *config.ServerConfig
-	upgrader   websocket.Upgrader
 	pools      map[int]*ConnectionPool
+	tunnels    map[string]*Tunnel
+	tunnelsMu  sync.RWMutex
 	mu         sync.RWMutex
 	httpServer *http.Server
 	shutdown   chan struct{}
 }
 
 type ConnectionPool struct {
-	conns   chan *websocket.Conn
+	tunnels chan *Tunnel
 	port    int
 	authKey string
 }
 
+type Tunnel struct {
+	id           string
+	uploadChan   chan []byte
+	downloadChan chan []byte
+	ctx          context.Context
+	cancel       context.CancelFunc
+}
+
 func NewServer(cfg *config.ServerConfig) *Server {
 	return &Server{
-		cfg: cfg,
-		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool {
-				return true
-			},
-		},
+		cfg:      cfg,
 		pools:    make(map[int]*ConnectionPool),
+		tunnels:  make(map[string]*Tunnel),
 		shutdown: make(chan struct{}),
 	}
 }
@@ -49,9 +53,16 @@ func (s *Server) Start() error {
 	log.Info("Starting FRP server", "addr", addr)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", s.handleWebSocket)
+	mux.HandleFunc("/tunnel/download", s.handleDownload)
+	mux.HandleFunc("/tunnel/upload", s.handleUpload)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/shutdown", s.handleShutdown)
+	
+	log.Info("HTTP endpoints registered",
+		"download", "/tunnel/download",
+		"upload", "/tunnel/upload",
+		"health", "/health",
+		"shutdown", "/shutdown")
 
 	s.httpServer = &http.Server{
 		Addr:    addr,
@@ -99,35 +110,148 @@ func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
-func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
-	// Get remote port from query parameter
+// handleDownload streams data from TCP connection to client via HTTP GET
+func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get parameters
 	remotePortStr := r.URL.Query().Get("remote_port")
-	if remotePortStr == "" {
-		http.Error(w, "remote_port parameter required", http.StatusBadRequest)
+	tunnelID := r.URL.Query().Get("tunnel_id")
+	
+	if remotePortStr == "" || tunnelID == "" {
+		http.Error(w, "remote_port and tunnel_id parameters required", http.StatusBadRequest)
 		return
 	}
 
 	var remotePort int
 	fmt.Sscanf(remotePortStr, "%d", &remotePort)
 
-	conn, err := s.upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Error("Failed to upgrade connection", "error", err)
-		return
-	}
-
-	log.Info("New WebSocket connection", "remote", r.RemoteAddr, "port", remotePort)
+	log.Info("New download stream", "remote", r.RemoteAddr, "port", remotePort, "tunnel_id", tunnelID)
 
 	// Get or create connection pool for this port
 	pool := s.getOrCreatePool(remotePort)
 	
-	// Add connection to pool
+	// Create tunnel
+	ctx, cancel := context.WithCancel(r.Context())
+	tunnel := &Tunnel{
+		id:           tunnelID,
+		uploadChan:   make(chan []byte, 100),
+		downloadChan: make(chan []byte, 100),
+		ctx:          ctx,
+		cancel:       cancel,
+	}
+	
+	// Register tunnel globally
+	s.tunnelsMu.Lock()
+	s.tunnels[tunnelID] = tunnel
+	s.tunnelsMu.Unlock()
+	
+	// Clean up tunnel on exit
+	defer func() {
+		s.tunnelsMu.Lock()
+		delete(s.tunnels, tunnelID)
+		s.tunnelsMu.Unlock()
+	}()
+	
+	// Add tunnel to pool
 	select {
-	case pool.conns <- conn:
-		log.Debug("Connection added to pool", "port", remotePort)
+	case pool.tunnels <- tunnel:
+		log.Debug("Tunnel added to pool", "port", remotePort, "tunnel_id", tunnelID)
 	default:
-		log.Warn("Connection pool full, closing connection", "port", remotePort)
-		conn.Close()
+		log.Warn("Tunnel pool full, rejecting connection", "port", remotePort)
+		http.Error(w, "Pool full", http.StatusServiceUnavailable)
+		cancel()
+		return
+	}
+
+	// Set headers for streaming
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		log.Error("Streaming not supported")
+		cancel()
+		return
+	}
+
+	// Stream data from upload channel to HTTP response
+	for {
+		select {
+		case <-ctx.Done():
+			log.Debug("Download stream closed", "tunnel_id", tunnelID)
+			return
+		case data := <-tunnel.uploadChan:
+			if len(data) == 0 {
+				continue
+			}
+			
+			_, err := w.Write(data)
+			if err != nil {
+				log.Debug("Failed to write to download stream", "error", err, "tunnel_id", tunnelID)
+				cancel()
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+// handleUpload receives data from client via HTTP POST and forwards to TCP
+func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	tunnelID := r.URL.Query().Get("tunnel_id")
+	if tunnelID == "" {
+		http.Error(w, "tunnel_id parameter required", http.StatusBadRequest)
+		return
+	}
+
+	// Read data from request body
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Debug("Failed to read upload data", "error", err, "tunnel_id", tunnelID)
+		http.Error(w, "Failed to read data", http.StatusBadRequest)
+		return
+	}
+
+	if len(data) == 0 {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+		return
+	}
+
+	log.Debug("Received upload data", "tunnel_id", tunnelID, "size", len(data))
+
+	// Find the tunnel and send data to it
+	s.tunnelsMu.RLock()
+	tunnel, exists := s.tunnels[tunnelID]
+	s.tunnelsMu.RUnlock()
+
+	if !exists {
+		log.Warn("Tunnel not found", "tunnel_id", tunnelID)
+		http.Error(w, "Tunnel not found", http.StatusNotFound)
+		return
+	}
+
+	// Send data to download channel (will be written to TCP)
+	select {
+	case tunnel.downloadChan <- data:
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	case <-tunnel.ctx.Done():
+		http.Error(w, "Tunnel closed", http.StatusGone)
+	case <-time.After(5 * time.Second):
+		log.Warn("Download channel blocked", "tunnel_id", tunnelID)
+		http.Error(w, "Timeout", http.StatusRequestTimeout)
 	}
 }
 
@@ -138,7 +262,7 @@ func (s *Server) getOrCreatePool(port int) *ConnectionPool {
 	pool, exists := s.pools[port]
 	if !exists {
 		pool = &ConnectionPool{
-			conns:   make(chan *websocket.Conn, 10),
+			tunnels: make(chan *Tunnel, 10),
 			port:    port,
 			authKey: s.cfg.AuthKey,
 		}
@@ -171,28 +295,30 @@ func (s *Server) startTCPListener(pool *ConnectionPool) {
 
 		log.Debug("New TCP connection", "remote", tcpConn.RemoteAddr(), "port", pool.port)
 
-		// Get a WebSocket connection from the pool
+		// Get a tunnel from the pool
 		select {
-		case wsConn := <-pool.conns:
-			go s.handleTCPConnection(tcpConn, wsConn)
+		case tunnel := <-pool.tunnels:
+			go s.handleTCPConnection(tcpConn, tunnel)
 		case <-time.After(5 * time.Second):
-			log.Warn("No WebSocket connection available in pool", "port", pool.port)
+			log.Warn("No tunnel available in pool", "port", pool.port)
 			tcpConn.Close()
 		}
 	}
 }
 
-func (s *Server) handleTCPConnection(tcpConn net.Conn, wsConn *websocket.Conn) {
+func (s *Server) handleTCPConnection(tcpConn net.Conn, tunnel *Tunnel) {
 	defer tcpConn.Close()
-	defer wsConn.Close()
+	defer tunnel.cancel()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	log.Debug("Handling TCP connection with tunnel", "tunnel_id", tunnel.id)
+
+	ctx, cancel := context.WithCancel(tunnel.ctx)
 	defer cancel()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// TCP -> WebSocket
+	// TCP -> Upload channel (which streams to client via GET)
 	go func() {
 		defer wg.Done()
 		defer cancel()
@@ -214,14 +340,22 @@ func (s *Server) handleTCPConnection(tcpConn net.Conn, wsConn *websocket.Conn) {
 				return
 			}
 
-			if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
-				log.Debug("WebSocket write error", "error", err)
+			// Send data to upload channel (will be streamed via GET)
+			data := make([]byte, n)
+			copy(data, buf[:n])
+			
+			select {
+			case tunnel.uploadChan <- data:
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+				log.Warn("Upload channel blocked, closing connection")
 				return
 			}
 		}
 	}()
 
-	// WebSocket -> TCP
+	// Download channel -> TCP (data from client POST requests)
 	go func() {
 		defer wg.Done()
 		defer cancel()
@@ -230,25 +364,21 @@ func (s *Server) handleTCPConnection(tcpConn net.Conn, wsConn *websocket.Conn) {
 			select {
 			case <-ctx.Done():
 				return
-			default:
-			}
-
-			wsConn.SetReadDeadline(time.Now().Add(30 * time.Second))
-			_, data, err := wsConn.ReadMessage()
-			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-					log.Debug("WebSocket read error", "error", err)
+			case data := <-tunnel.downloadChan:
+				if len(data) == 0 {
+					continue
 				}
-				return
-			}
 
-			if _, err := tcpConn.Write(data); err != nil {
-				log.Debug("TCP write error", "error", err)
-				return
+				tcpConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+				_, err := tcpConn.Write(data)
+				if err != nil {
+					log.Debug("TCP write error", "error", err)
+					return
+				}
 			}
 		}
 	}()
 
 	wg.Wait()
-	log.Debug("Connection closed")
+	log.Debug("TCP connection handler finished", "tunnel_id", tunnel.id)
 }

@@ -1,19 +1,20 @@
 package client
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"sync"
 	"time"
 
 	"neofrp/internal/config"
 
 	"github.com/charmbracelet/log"
-	"github.com/gorilla/websocket"
 )
 
 type Client struct {
@@ -22,12 +23,26 @@ type Client struct {
 }
 
 type ConnectionPool struct {
-	conns    []*websocket.Conn
-	mu       sync.Mutex
-	cfg      *config.ClientConfig
-	ctx      context.Context
-	cancel   context.CancelFunc
+	tunnels []*Tunnel
+	mu      sync.Mutex
+	cfg     *config.ClientConfig
+	ctx     context.Context
+	cancel  context.CancelFunc
 }
+
+type Tunnel struct {
+	id         string
+	httpClient *http.Client
+	cfg        *config.ClientConfig
+	ctx        context.Context
+	cancel     context.CancelFunc
+}
+func generateTunnelID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
 
 func NewClient(cfg *config.ClientConfig) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -35,10 +50,10 @@ func NewClient(cfg *config.ClientConfig) *Client {
 	return &Client{
 		cfg: cfg,
 		pool: &ConnectionPool{
-			conns:  make([]*websocket.Conn, 0, cfg.PoolSize),
-			cfg:    cfg,
-			ctx:    ctx,
-			cancel: cancel,
+			tunnels: make([]*Tunnel, 0, cfg.PoolSize),
+			cfg:     cfg,
+			ctx:     ctx,
+			cancel:  cancel,
 		},
 	}
 }
@@ -52,8 +67,8 @@ func (c *Client) Start() error {
 
 	// Initialize connection pool
 	for i := 0; i < c.cfg.PoolSize; i++ {
-		if err := c.pool.addConnection(); err != nil {
-			log.Error("Failed to create initial connection", "index", i, "error", err)
+		if err := c.pool.addTunnel(); err != nil {
+			log.Error("Failed to create initial tunnel", "index", i, "error", err)
 		}
 	}
 
@@ -64,114 +79,93 @@ func (c *Client) Start() error {
 	select {}
 }
 
-func (p *ConnectionPool) addConnection() error {
-	// Build WebSocket URL
-	scheme := "ws"
-	if p.cfg.ServerPort == 443 {
-		scheme = "wss"
+func (p *ConnectionPool) addTunnel() error {
+	// Generate unique tunnel ID
+	tunnelID := generateTunnelID()
+
+	ctx, cancel := context.WithCancel(p.ctx)
+	
+	tunnel := &Tunnel{
+		id: tunnelID,
+		httpClient: &http.Client{
+			Timeout: 0, // No timeout for streaming
+		},
+		cfg:    p.cfg,
+		ctx:    ctx,
+		cancel: cancel,
 	}
-
-	u := url.URL{
-		Scheme:   scheme,
-		Host:     fmt.Sprintf("%s:%d", p.cfg.ServerAddr, p.cfg.ServerPort),
-		Path:     "/ws",
-		RawQuery: fmt.Sprintf("remote_port=%d", p.cfg.RemotePort),
-	}
-
-	// Create HTTP header with Authorization
-	header := http.Header{}
-	header.Set("Authorization", fmt.Sprintf("Bearer %s", p.cfg.AuthKey))
-
-	// Connect to server
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 10 * time.Second,
-	}
-
-	conn, _, err := dialer.Dial(u.String(), header)
-	if err != nil {
-		return fmt.Errorf("failed to connect to server: %w", err)
-	}
-
-	log.Info("WebSocket connection established", "server", u.Host)
 
 	p.mu.Lock()
-	p.conns = append(p.conns, conn)
+	p.tunnels = append(p.tunnels, tunnel)
 	p.mu.Unlock()
 
-	// Handle this connection
-	go p.handleConnection(conn)
+	log.Info("Tunnel created", "tunnel_id", tunnelID)
+
+	// Start handling this tunnel
+	go p.handleTunnel(tunnel)
 
 	return nil
 }
 
-func (p *ConnectionPool) handleConnection(wsConn *websocket.Conn) {
+func (p *ConnectionPool) handleTunnel(tunnel *Tunnel) {
 	defer func() {
-		wsConn.Close()
-		p.removeConnection(wsConn)
+		tunnel.cancel()
+		p.removeTunnel(tunnel)
 	}()
 
-	// Wait for server to send us data (indicating a new TCP connection)
-	wsConn.SetReadDeadline(time.Time{}) // No deadline for first message
-	_, firstData, err := wsConn.ReadMessage()
+	// Build server URL
+	scheme := "http"
+	if tunnel.cfg.ServerPort == 443 {
+		scheme = "https"
+	}
+
+	baseURL := fmt.Sprintf("%s://%s:%d", scheme, tunnel.cfg.ServerAddr, tunnel.cfg.ServerPort)
+	
+	// Start download stream (GET request)
+	downloadURL := fmt.Sprintf("%s/tunnel/download?remote_port=%d&tunnel_id=%s",
+		baseURL, tunnel.cfg.RemotePort, tunnel.id)
+
+	req, err := http.NewRequestWithContext(tunnel.ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
-		log.Debug("WebSocket closed before use", "error", err)
+		log.Error("Failed to create download request", "error", err, "tunnel_id", tunnel.id)
 		return
 	}
 
+	// Add authorization header
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", tunnel.cfg.AuthKey))
+
+	resp, err := tunnel.httpClient.Do(req)
+	if err != nil {
+		log.Error("Failed to start download stream", "error", err, "tunnel_id", tunnel.id)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Error("Download stream failed", "status", resp.StatusCode, "tunnel_id", tunnel.id)
+		return
+	}
+
+	log.Info("Download stream established", "tunnel_id", tunnel.id)
+
 	// Connect to local service
-	localAddr := fmt.Sprintf("%s:%d", p.cfg.LocalAddr, p.cfg.LocalPort)
+	localAddr := fmt.Sprintf("%s:%d", tunnel.cfg.LocalAddr, tunnel.cfg.LocalPort)
 	tcpConn, err := net.DialTimeout("tcp", localAddr, 5*time.Second)
 	if err != nil {
-		log.Error("Failed to connect to local service", "addr", localAddr, "error", err)
+		log.Error("Failed to connect to local service", "addr", localAddr, "error", err, "tunnel_id", tunnel.id)
 		return
 	}
 	defer tcpConn.Close()
 
-	log.Debug("Connected to local service", "addr", localAddr)
+	log.Debug("Connected to local service", "addr", localAddr, "tunnel_id", tunnel.id)
 
-	// Write the first message to local service
-	if len(firstData) > 0 {
-		if _, err := tcpConn.Write(firstData); err != nil {
-			log.Debug("Failed to write first message to TCP", "error", err)
-			return
-		}
-	}
-
-	ctx, cancel := context.WithCancel(p.ctx)
+	ctx, cancel := context.WithCancel(tunnel.ctx)
 	defer cancel()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// WebSocket -> TCP
-	go func() {
-		defer wg.Done()
-		defer cancel()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-
-			wsConn.SetReadDeadline(time.Now().Add(30 * time.Second))
-			_, data, err := wsConn.ReadMessage()
-			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-					log.Debug("WebSocket read error", "error", err)
-				}
-				return
-			}
-
-			if _, err := tcpConn.Write(data); err != nil {
-				log.Debug("TCP write error", "error", err)
-				return
-			}
-		}
-	}()
-
-	// TCP -> WebSocket
+	// Download stream -> TCP (data from server via GET)
 	go func() {
 		defer wg.Done()
 		defer cancel()
@@ -184,36 +178,94 @@ func (p *ConnectionPool) handleConnection(wsConn *websocket.Conn) {
 			default:
 			}
 
-			tcpConn.SetReadDeadline(time.Now().Add(30 * time.Second))
-			n, err := tcpConn.Read(buf)
+			n, err := resp.Body.Read(buf)
 			if err != nil {
 				if err != io.EOF {
-					log.Debug("TCP read error", "error", err)
+					log.Debug("Download stream read error", "error", err, "tunnel_id", tunnel.id)
 				}
 				return
 			}
 
-			if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
-				log.Debug("WebSocket write error", "error", err)
+			if n > 0 {
+				tcpConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+				_, err := tcpConn.Write(buf[:n])
+				if err != nil {
+					log.Debug("TCP write error", "error", err, "tunnel_id", tunnel.id)
+					return
+				}
+			}
+		}
+	}()
+
+	// TCP -> Upload (data to server via POST)
+	go func() {
+		defer wg.Done()
+		defer cancel()
+
+		buf := make([]byte, 32*1024)
+		uploadURL := fmt.Sprintf("%s/tunnel/upload?tunnel_id=%s", baseURL, tunnel.id)
+
+		for {
+			select {
+			case <-ctx.Done():
 				return
+			default:
+			}
+
+			tcpConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+			n, err := tcpConn.Read(buf)
+			if err != nil {
+				if err != io.EOF {
+					log.Debug("TCP read error", "error", err, "tunnel_id", tunnel.id)
+				}
+				return
+			}
+
+			if n > 0 {
+				// Send data via POST request
+				data := make([]byte, n)
+				copy(data, buf[:n])
+
+				postReq, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL, bytes.NewReader(data))
+				if err != nil {
+					log.Debug("Failed to create upload request", "error", err, "tunnel_id", tunnel.id)
+					return
+				}
+
+				postReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", tunnel.cfg.AuthKey))
+				postReq.Header.Set("Content-Type", "application/octet-stream")
+
+				postResp, err := tunnel.httpClient.Do(postReq)
+				if err != nil {
+					log.Debug("Upload request failed", "error", err, "tunnel_id", tunnel.id)
+					return
+				}
+				postResp.Body.Close()
+
+				if postResp.StatusCode != http.StatusOK {
+					log.Debug("Upload failed", "status", postResp.StatusCode, "tunnel_id", tunnel.id)
+					return
+				}
 			}
 		}
 	}()
 
 	wg.Wait()
-	log.Debug("Connection handler finished")
+	log.Debug("Tunnel handler finished", "tunnel_id", tunnel.id)
 }
 
-func (p *ConnectionPool) removeConnection(conn *websocket.Conn) {
+func (p *ConnectionPool) removeTunnel(tunnel *Tunnel) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	for i, c := range p.conns {
-		if c == conn {
-			p.conns = append(p.conns[:i], p.conns[i+1:]...)
+	for i, t := range p.tunnels {
+		if t.id == tunnel.id {
+			p.tunnels = append(p.tunnels[:i], p.tunnels[i+1:]...)
 			break
 		}
 	}
+	
+	log.Debug("Tunnel removed from pool", "tunnel_id", tunnel.id)
 }
 
 func (p *ConnectionPool) maintain() {
@@ -226,15 +278,15 @@ func (p *ConnectionPool) maintain() {
 			return
 		case <-ticker.C:
 			p.mu.Lock()
-			current := len(p.conns)
+			current := len(p.tunnels)
 			p.mu.Unlock()
 
 			needed := p.cfg.PoolSize - current
 			if needed > 0 {
-				log.Debug("Replenishing connection pool", "current", current, "needed", needed)
+				log.Debug("Replenishing tunnel pool", "current", current, "needed", needed)
 				for i := 0; i < needed; i++ {
-					if err := p.addConnection(); err != nil {
-						log.Warn("Failed to add connection to pool", "error", err)
+					if err := p.addTunnel(); err != nil {
+						log.Warn("Failed to add tunnel to pool", "error", err)
 						time.Sleep(1 * time.Second)
 					}
 				}
