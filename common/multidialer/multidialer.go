@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/log"
+	"github.com/gorilla/websocket"
 	"github.com/quic-go/quic-go"
 )
 
@@ -50,7 +52,7 @@ type Session interface {
 // --- Unified Constructors ---
 
 // Dial connects to a remote address and returns a session.
-// protocol must be "tcp" or "quic".
+// protocol must be "tcp", "quic", "ws", or "wss".
 func Dial(ctx context.Context, protocol, address string, tlsConfig *tls.Config) (Session, error) {
 	switch protocol {
 	case "tcp":
@@ -74,6 +76,21 @@ func Dial(ctx context.Context, protocol, address string, tlsConfig *tls.Config) 
 			return nil, err
 		}
 		return NewQUICSession(conn), nil
+	case "ws", "wss":
+		scheme := "ws"
+		if protocol == "wss" {
+			scheme = "wss"
+		}
+		url := fmt.Sprintf("%s://%s", scheme, address)
+		dialer := websocket.Dialer{
+			TLSClientConfig: tlsConfig,
+			Subprotocols:    []string{"neofrp"},
+		}
+		conn, _, err := dialer.DialContext(ctx, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		return NewWebSocketSession(conn, true), nil // isClient = true
 	default:
 		return nil, fmt.Errorf("unsupported protocol: %s", protocol)
 	}
@@ -107,6 +124,8 @@ func Listen(ctx context.Context, protocol, address string, tlsConfig *tls.Config
 			return nil, err
 		}
 		return &quicListener{Listener: l}, nil
+	case "ws", "wss":
+		return NewWebSocketListener(address, tlsConfig, protocol == "wss")
 	default:
 		return nil, fmt.Errorf("unsupported protocol: %s", protocol)
 	}
@@ -538,6 +557,179 @@ func (s *tcpStream) sessionClosed(err error) {
 // tcpListener wraps a net.Listener to accept Sessions instead of Conns.
 type tcpListener struct {
 	net.Listener
+}
+// --- WebSocket Implementation ---
+
+// wsConn wraps a websocket.Conn to implement io.ReadWriteCloser
+type wsConn struct {
+	conn *websocket.Conn
+	mu   sync.Mutex
+	buf  []byte
+}
+
+
+func newWSConn(conn *websocket.Conn) *wsConn {
+	return &wsConn{
+		conn: conn,
+		buf:  make([]byte, 0),
+	}
+}
+
+func (w *wsConn) Read(p []byte) (n int, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// If we have buffered data, return it first
+	if len(w.buf) > 0 {
+		n = copy(p, w.buf)
+		w.buf = w.buf[n:]
+		return n, nil
+	}
+
+	// Read next message from websocket
+	messageType, data, err := w.conn.ReadMessage()
+	if err != nil {
+		return 0, err
+	}
+
+	if messageType != websocket.BinaryMessage {
+		return 0, fmt.Errorf("unexpected message type: %d", messageType)
+	}
+
+	// Copy what we can to p, buffer the rest
+	n = copy(p, data)
+	if n < len(data) {
+		w.buf = append(w.buf, data[n:]...)
+	}
+
+	return n, nil
+}
+
+func (w *wsConn) Write(p []byte) (n int, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	err = w.conn.WriteMessage(websocket.BinaryMessage, p)
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (w *wsConn) Close() error {
+	return w.conn.Close()
+}
+
+// NewWebSocketSession creates a new session over a WebSocket connection
+func NewWebSocketSession(conn *websocket.Conn, isClient bool) Session {
+	wsConn := newWSConn(conn)
+	return NewTCPSession(wsConn, isClient)
+}
+
+// wsListener implements SessionListener for WebSocket
+type wsListener struct {
+	server   *http.Server
+	upgrader websocket.Upgrader
+	acceptCh chan Session
+	errCh    chan error
+	addr     net.Addr
+	closeCh  chan struct{}
+	closeOnce sync.Once
+}
+
+// NewWebSocketListener creates a new WebSocket listener
+func NewWebSocketListener(address string, tlsConfig *tls.Config, useTLS bool) (SessionListener, error) {
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return nil, err
+	}
+
+	wsl := &wsListener{
+		upgrader: websocket.Upgrader{
+			Subprotocols: []string{"neofrp"},
+			CheckOrigin: func(r *http.Request) bool {
+				return true // Accept all origins for FRP
+			},
+		},
+		acceptCh: make(chan Session, 10),
+		errCh:    make(chan error, 1),
+		addr:     listener.Addr(),
+		closeCh:  make(chan struct{}),
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", wsl.handleWebSocket)
+
+	wsl.server = &http.Server{
+		Handler:   mux,
+		TLSConfig: tlsConfig,
+	}
+
+	go func() {
+		var err error
+		if useTLS {
+			// For TLS, we need cert and key from tlsConfig
+			// Since we already have tlsConfig, we can use ServeTLS with empty cert/key
+			// The TLSConfig will be used
+			err = wsl.server.ServeTLS(listener, "", "")
+		} else {
+			err = wsl.server.Serve(listener)
+		}
+		if err != nil && err != http.ErrServerClosed {
+			select {
+			case wsl.errCh <- err:
+			default:
+			}
+		}
+	}()
+
+	return wsl, nil
+}
+
+func (wsl *wsListener) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := wsl.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Errorf("WebSocket upgrade failed: %v", err)
+		return
+	}
+
+	session := NewWebSocketSession(conn, false) // isClient = false for server
+	select {
+	case wsl.acceptCh <- session:
+	case <-wsl.closeCh:
+		conn.Close()
+	}
+}
+
+func (wsl *wsListener) AcceptSession() (Session, error) {
+	select {
+	case session := <-wsl.acceptCh:
+		return session, nil
+	case err := <-wsl.errCh:
+		return nil, err
+	case <-wsl.closeCh:
+		return nil, fmt.Errorf("listener closed")
+	}
+}
+
+func (wsl *wsListener) Accept() (net.Conn, error) {
+	session, err := wsl.AcceptSession()
+	if err != nil {
+		return nil, err
+	}
+	return &sessionConn{Session: session}, nil
+}
+
+func (wsl *wsListener) Close() error {
+	wsl.closeOnce.Do(func() {
+		close(wsl.closeCh)
+		wsl.server.Close()
+	})
+	return nil
+}
+
+func (wsl *wsListener) Addr() net.Addr {
+	return wsl.addr
 }
 
 func (l *tcpListener) AcceptSession() (Session, error) {

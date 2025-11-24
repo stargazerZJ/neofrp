@@ -143,6 +143,9 @@ func GetTLSConfig(config *config.ClientTransportConfig) (*tls.Config, error) {
 
 	if config.Protocol == "quic" {
 		tlsConfig.NextProtos = []string{"h3"}
+	} else if config.Protocol == "wss" {
+		// WebSocket over TLS uses standard ALPN
+		tlsConfig.NextProtos = []string{"http/1.1"}
 	}
 
 	return tlsConfig, nil

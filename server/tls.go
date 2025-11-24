@@ -20,10 +20,16 @@ func GetTLSConfig(cfg *config.ServerTransportConfig) (*tls.Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to load x509 key pair: %v", err)
 		}
-		return &tls.Config{
+		tlsConfig := &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
-		}, nil
+		}
+		if cfg.Protocol == "quic" {
+			tlsConfig.NextProtos = []string{"h3"}
+		} else if cfg.Protocol == "wss" {
+			tlsConfig.NextProtos = []string{"http/1.1"}
+		}
+		return tlsConfig, nil
 	}
 
 	// Generate a self-signed certificate for the server
@@ -39,6 +45,8 @@ func GetTLSConfig(cfg *config.ServerTransportConfig) (*tls.Config, error) {
 
 	if cfg.Protocol == "quic" {
 		tlsConfig.NextProtos = []string{"h3"}
+	} else if cfg.Protocol == "wss" {
+		tlsConfig.NextProtos = []string{"http/1.1"}
 	}
 
 	return tlsConfig, nil

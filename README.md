@@ -12,10 +12,11 @@ A modern, high-performance reverse proxy implementation in Go, focusing on speed
 ## 🚀 Features
 
 - **High Performance**: Built with Go for concurrent processing and low latency. TCP performance 80% faster than FRP under the same setting.
-- **Secure Communication**: Enforced secure communication via QUIC(udp) and TLS(tcp) transport
+- **Secure Communication**: Enforced secure communication via QUIC(udp), TLS(tcp), and WebSocket (ws/wss) transport
 - **Port Multiplexing**: Allowing for efficient handling of multiple TCP/UDP port forwarding
 - **Easy Configuration**: JSON-based configuration files
 - **Comprehensive Logging**: Structured logging with configurable levels
+- **WebSocket Support**: WebSocket (ws) and secure WebSocket (wss) transport for compatibility with HTTP/HTTPS reverse proxies
 
 ## 📋 Table of Contents
 
@@ -129,7 +130,7 @@ You can forward any local port, TCP or UDP, by editing the `client.json` file an
 |-------|------|-------------|---------|
 | `log.log_level` | string | Logging level (debug, info, warn, error, fatal) | "info" |
 | `recognized_tokens` | array | List of valid client tokens | [] |
-| `transport.protocol` | string | Transport protocol ("quic" or "tcp") | "quic" |
+| `transport.protocol` | string | Transport protocol ("quic", "tcp", "ws", or "wss") | "quic" |
 | `transport.port` | number | Server listening port | Required |
 | `transport.cert_file` | string | Path to TLS certificate file | (self-signed) |
 | `transport.key_file` | string | Path to TLS key file | (self-signed) |
@@ -150,7 +151,7 @@ This will expand to a list of ports from 1000 to 1200, inclusive, connected by c
 |-------|------|-------------|---------|
 | `log.log_level` | string | Logging level (debug, info, warn, error, fatal) | "info" |
 | `token` | string | Authentication token | Required |
-| `transport.protocol` | string | Transport protocol ("quic" or "tcp") | "quic" |
+| `transport.protocol` | string | Transport protocol ("quic", "tcp", "ws", or "wss") | "quic" |
 | `transport.server_ip` | string | Server IP address | Required |
 | `transport.server_port` | number | Server port | Required |
 | `transport.ca_file` | string | Path to CA file for server verification | (none) |
