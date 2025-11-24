@@ -254,7 +254,16 @@ func (p *ConnectionPool) handleTunnel(tunnel *Tunnel) {
 				postResp.Body.Close()
 
 				if postResp.StatusCode != http.StatusOK {
-					log.Debug("Upload failed", "status", postResp.StatusCode, "tunnel_id", tunnel.id)
+					// Try to read error message from response body
+					errMsg := ""
+					if postResp.Body != nil {
+						// Read up to 256B of error message
+						buf := make([]byte, 256)
+						if n, err := postResp.Body.Read(buf); err == nil && n > 0 {
+							errMsg = string(buf[:n])
+						}
+					}
+					log.Debug("Upload failed", "status", postResp.StatusCode, "tunnel_id", tunnel.id, "error_message", errMsg)
 					return
 				}
 			}
