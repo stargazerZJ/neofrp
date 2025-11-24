@@ -289,7 +289,6 @@ func (p *ConnectionPool) handleTunnel(tunnel *Tunnel) {
 			default:
 			}
 
-			tcpConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 			n, err := tcpConn.Read(buf)
 			if err != nil {
 				if err != io.EOF {
