@@ -1,0 +1,9 @@
+# Test Client Configuration - Direct Connection
+server_addr = "127.0.0.1"
+server_port = 7000
+auth_key = "test-secret-key-12345"
+local_addr = "127.0.0.1"
+local_port = 8888
+remote_port = 9999
+pool_size = 3
+log_level = "debug"

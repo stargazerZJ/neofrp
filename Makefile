@@ -1,8 +1,8 @@
-.PHONY: all build clean server client test
+.PHONY: all build clean server client test test-proxy
 
 all: build
 
-build: server client
+build: server client test-proxy
 
 server:
 	@echo "Building frps..."
@@ -11,6 +11,10 @@ server:
 client:
 	@echo "Building frpc..."
 	@go build -o bin/frpc cmd/frpc/main.go
+
+test-proxy:
+	@echo "Building test-proxy..."
+	@go build -o bin/test-proxy cmd/test-proxy/main.go
 
 clean:
 	@echo "Cleaning..."
