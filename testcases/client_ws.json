@@ -1,0 +1,25 @@
+{
+    "log": {
+        "log_level": "debug"
+    },
+    "token": "user_token",
+    "transport": {
+        "protocol": "ws",
+        "server_ip": "127.0.0.1",
+        "server_port": 3400,
+        "ca_file": "",
+        "server_name": "localhost"
+    },
+    "connections": [
+        {
+            "type": "tcp",
+            "local_port": 25560,
+            "server_port": 35560
+        },
+        {
+            "type": "udp",
+            "local_port": 25561,
+            "server_port": 35561
+        }
+    ]
+}

@@ -77,8 +77,9 @@ func ValidateClientConfig(config *config.ClientConfig) error {
 	if config.Token == "" {
 		return fmt.Errorf("token is required")
 	}
-	if config.TransportConfig.Protocol != "quic" && config.TransportConfig.Protocol != "tcp" {
-		return fmt.Errorf("invalid transport protocol: %s. Options are: quic, tcp", config.TransportConfig.Protocol)
+	if config.TransportConfig.Protocol != "quic" && config.TransportConfig.Protocol != "tcp" &&
+		config.TransportConfig.Protocol != "ws" && config.TransportConfig.Protocol != "wss" {
+		return fmt.Errorf("invalid transport protocol: %s. Options are: quic, tcp, ws, wss", config.TransportConfig.Protocol)
 	}
 	if config.TransportConfig.IP == "" {
 		return fmt.Errorf("server IP is required in field 'transport'")
@@ -103,8 +104,9 @@ func ValidateClientConfig(config *config.ClientConfig) error {
 }
 
 func ValidateServerConfig(config *config.ServerConfig) error {
-	if config.TransportConfig.Protocol != "quic" && config.TransportConfig.Protocol != "tcp" {
-		return fmt.Errorf("invalid transport protocol: %s. Options are: quic, tcp", config.TransportConfig.Protocol)
+	if config.TransportConfig.Protocol != "quic" && config.TransportConfig.Protocol != "tcp" &&
+		config.TransportConfig.Protocol != "ws" && config.TransportConfig.Protocol != "wss" {
+		return fmt.Errorf("invalid transport protocol: %s. Options are: quic, tcp, ws, wss", config.TransportConfig.Protocol)
 	}
 	if config.TransportConfig.Port == 0 {
 		return fmt.Errorf("server port is required in field 'transport'")
