@@ -687,6 +687,11 @@ func (l *wsListener) serve() {
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
 	http.Serve(l.Listener, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("OK"))
+			return
+		}
 		c, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			log.Errorf("upgrade failed: %v", err)
