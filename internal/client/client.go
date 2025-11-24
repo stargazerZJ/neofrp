@@ -313,7 +313,10 @@ func (p *ConnectionPool) handleTunnel(tunnel *Tunnel) {
 
 				postResp, err := tunnel.httpClient.Do(postReq)
 				if err != nil {
-					log.Debug("Upload request failed", "error", err, "tunnel_id", tunnel.id)
+					// Don't log context canceled errors - they're expected during shutdown
+					if ctx.Err() == nil {
+						log.Debug("Upload request failed", "error", err, "tunnel_id", tunnel.id)
+					}
 					return
 				}
 				postResp.Body.Close()
