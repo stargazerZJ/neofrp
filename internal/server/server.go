@@ -262,7 +262,7 @@ func (s *Server) getOrCreatePool(port int) *ConnectionPool {
 	pool, exists := s.pools[port]
 	if !exists {
 		pool = &ConnectionPool{
-			tunnels: make(chan *Tunnel, 10),
+			tunnels: make(chan *Tunnel, 10000), // Large buffer to handle many concurrent connections
 			port:    port,
 			authKey: s.cfg.AuthKey,
 		}
