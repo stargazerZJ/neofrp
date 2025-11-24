@@ -100,14 +100,14 @@ func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// Check Authorization header
-	authHeader := r.Header.Get("Authorization")
-	expectedAuth := fmt.Sprintf("Bearer %s", s.cfg.AuthKey)
-	if authHeader != expectedAuth {
-		log.Warn("Unauthorized connection attempt", "remote", r.RemoteAddr)
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
+	// Don't Check Authorization header because the reverse proxy will strip it
+	// authHeader := r.Header.Get("Authorization")
+	// expectedAuth := fmt.Sprintf("Bearer %s", s.cfg.AuthKey)
+	// if authHeader != expectedAuth {
+	// 	log.Warn("Unauthorized connection attempt", "remote", r.RemoteAddr)
+	// 	http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	// 	return
+	// }
 
 	// Get remote port from query parameter
 	remotePortStr := r.URL.Query().Get("remote_port")
