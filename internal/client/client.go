@@ -23,11 +23,12 @@ type Client struct {
 }
 
 type ConnectionPool struct {
-	tunnels []*Tunnel
-	mu      sync.Mutex
-	cfg     *config.ClientConfig
-	ctx     context.Context
-	cancel  context.CancelFunc
+	tunnels       []*Tunnel
+	mu            sync.Mutex
+	cfg           *config.ClientConfig
+	ctx           context.Context
+	cancel        context.CancelFunc
+	replenishChan chan struct{}
 }
 
 type Tunnel struct {
@@ -50,10 +51,11 @@ func NewClient(cfg *config.ClientConfig) *Client {
 	return &Client{
 		cfg: cfg,
 		pool: &ConnectionPool{
-			tunnels: make([]*Tunnel, 0, cfg.PoolSize),
-			cfg:     cfg,
-			ctx:     ctx,
-			cancel:  cancel,
+			tunnels:       make([]*Tunnel, 0, cfg.PoolSize),
+			cfg:           cfg,
+			ctx:           ctx,
+			cancel:        cancel,
+			replenishChan: make(chan struct{}, cfg.PoolSize),
 		},
 	}
 }
@@ -256,16 +258,21 @@ func (p *ConnectionPool) handleTunnel(tunnel *Tunnel) {
 
 func (p *ConnectionPool) removeTunnel(tunnel *Tunnel) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	for i, t := range p.tunnels {
 		if t.id == tunnel.id {
 			p.tunnels = append(p.tunnels[:i], p.tunnels[i+1:]...)
 			break
 		}
 	}
+	p.mu.Unlock()
 	
 	log.Debug("Tunnel removed from pool", "tunnel_id", tunnel.id)
+	
+	// Signal to replenish immediately
+	select {
+	case p.replenishChan <- struct{}{}:
+	default:
+	}
 }
 
 func (p *ConnectionPool) maintain() {
@@ -276,20 +283,28 @@ func (p *ConnectionPool) maintain() {
 		select {
 		case <-p.ctx.Done():
 			return
+		case <-p.replenishChan:
+			// Immediate replenishment when a tunnel is removed
+			p.replenishPool()
 		case <-ticker.C:
-			p.mu.Lock()
-			current := len(p.tunnels)
-			p.mu.Unlock()
+			// Periodic check to ensure pool is healthy
+			p.replenishPool()
+		}
+	}
+}
 
-			needed := p.cfg.PoolSize - current
-			if needed > 0 {
-				log.Debug("Replenishing tunnel pool", "current", current, "needed", needed)
-				for i := 0; i < needed; i++ {
-					if err := p.addTunnel(); err != nil {
-						log.Warn("Failed to add tunnel to pool", "error", err)
-						time.Sleep(1 * time.Second)
-					}
-				}
+func (p *ConnectionPool) replenishPool() {
+	p.mu.Lock()
+	current := len(p.tunnels)
+	p.mu.Unlock()
+
+	needed := p.cfg.PoolSize - current
+	if needed > 0 {
+		log.Debug("Replenishing tunnel pool", "current", current, "needed", needed)
+		for i := 0; i < needed; i++ {
+			if err := p.addTunnel(); err != nil {
+				log.Warn("Failed to add tunnel to pool", "error", err)
+				time.Sleep(1 * time.Second)
 			}
 		}
 	}
