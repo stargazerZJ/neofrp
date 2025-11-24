@@ -296,23 +296,40 @@ func (s *Server) startTCPListener(pool *ConnectionPool) {
 
 		log.Debug("New TCP connection", "remote", tcpConn.RemoteAddr(), "port", pool.port)
 
-		// Get a tunnel from the pool
-		select {
-		case tunnel := <-pool.tunnels:
-			// Send magic signal to inform client to dial local connection
+		// Keep trying to get a live tunnel from the pool
+		tunnelFound := false
+		timeout := time.After(5 * time.Second)
+		
+		for !tunnelFound {
 			select {
-			case tunnel.uploadChan <- protocol.MagicSignal:
-				log.Debug("Magic signal sent to client", "tunnel_id", tunnel.id)
-			case <-time.After(2 * time.Second):
-				log.Warn("Failed to send magic signal, closing connection", "tunnel_id", tunnel.id)
+			case tunnel := <-pool.tunnels:
+				// Check if tunnel is still alive before using it
+				select {
+				case <-tunnel.ctx.Done():
+					// Tunnel's GET request already closed, skip it and try next one
+					log.Debug("Skipping dead tunnel from pool", "tunnel_id", tunnel.id)
+					continue
+				default:
+					// Tunnel is alive, proceed
+				}
+				
+				// Send magic signal to inform client to dial local connection
+				select {
+				case tunnel.uploadChan <- protocol.MagicSignal:
+					log.Debug("Magic signal sent to client", "tunnel_id", tunnel.id)
+					go s.handleTCPConnection(tcpConn, tunnel)
+					tunnelFound = true
+				case <-time.After(2 * time.Second):
+					log.Warn("Failed to send magic signal, closing connection", "tunnel_id", tunnel.id)
+					tcpConn.Close()
+					tunnel.cancel()
+					tunnelFound = true
+				}
+			case <-timeout:
+				log.Warn("No tunnel available in pool", "port", pool.port)
 				tcpConn.Close()
-				tunnel.cancel()
-				continue
+				tunnelFound = true
 			}
-			go s.handleTCPConnection(tcpConn, tunnel)
-		case <-time.After(5 * time.Second):
-			log.Warn("No tunnel available in pool", "port", pool.port)
-			tcpConn.Close()
 		}
 	}
 }
