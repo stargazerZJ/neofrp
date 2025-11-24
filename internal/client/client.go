@@ -24,13 +24,13 @@ type Client struct {
 }
 
 type ConnectionPool struct {
-	standbyTunnels []*Tunnel // Fixed number of standby tunnels ready to be used
-	activeTunnels  []*Tunnel // Unlimited number of active tunnels handling connections
-	mu             sync.Mutex
-	cfg            *config.ClientConfig
-	ctx            context.Context
-	cancel         context.CancelFunc
-	replenishChan  chan struct{}
+	standbyCount  int // Number of standby tunnels ready to be used
+	activeCount   int // Number of active tunnels handling connections
+	mu            sync.Mutex
+	cfg           *config.ClientConfig
+	ctx           context.Context
+	cancel        context.CancelFunc
+	replenishChan chan struct{}
 }
 
 type Tunnel struct {
@@ -53,12 +53,12 @@ func NewClient(cfg *config.ClientConfig) *Client {
 	return &Client{
 		cfg: cfg,
 		pool: &ConnectionPool{
-			standbyTunnels: make([]*Tunnel, 0, cfg.PoolSize),
-			activeTunnels:  make([]*Tunnel, 0),
-			cfg:            cfg,
-			ctx:            ctx,
-			cancel:         cancel,
-			replenishChan:  make(chan struct{}, cfg.PoolSize),
+			standbyCount:  0,
+			activeCount:   0,
+			cfg:           cfg,
+			ctx:           ctx,
+			cancel:        cancel,
+			replenishChan: make(chan struct{}, cfg.PoolSize),
 		},
 	}
 }
@@ -101,10 +101,10 @@ func (p *ConnectionPool) addStandbyTunnel() error {
 	}
 
 	p.mu.Lock()
-	p.standbyTunnels = append(p.standbyTunnels, tunnel)
+	p.standbyCount++
 	p.mu.Unlock()
 
-	log.Info("Standby tunnel created", "tunnel_id", tunnelID)
+	log.Info("Standby tunnel created", "tunnel_id", tunnelID, "standby_count", p.standbyCount)
 
 	// Start handling this tunnel
 	go p.handleTunnel(tunnel)
@@ -112,28 +112,48 @@ func (p *ConnectionPool) addStandbyTunnel() error {
 	return nil
 }
 
-func (p *ConnectionPool) moveToActive(tunnel *Tunnel) {
+func (p *ConnectionPool) moveToActive() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	
-	// Remove from standby
-	for i, t := range p.standbyTunnels {
-		if t.id == tunnel.id {
-			p.standbyTunnels = append(p.standbyTunnels[:i], p.standbyTunnels[i+1:]...)
-			break
-		}
-	}
+	p.standbyCount--
+	p.activeCount++
 	
-	// Add to active
-	p.activeTunnels = append(p.activeTunnels, tunnel)
+	log.Debug("Tunnel moved to active", "standby_count", p.standbyCount, "active_count", p.activeCount)
+}
+
+func (p *ConnectionPool) decrementActive() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	
-	log.Debug("Tunnel moved to active", "tunnel_id", tunnel.id)
+	p.activeCount--
+	
+	log.Debug("Active tunnel finished", "standby_count", p.standbyCount, "active_count", p.activeCount)
+}
+
+func (p *ConnectionPool) decrementStandby() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	
+	p.standbyCount--
+	
+	log.Debug("Standby tunnel finished", "standby_count", p.standbyCount, "active_count", p.activeCount)
 }
 
 func (p *ConnectionPool) handleTunnel(tunnel *Tunnel) {
+	isStandby := true
 	defer func() {
 		tunnel.cancel()
-		p.removeTunnel(tunnel)
+		if isStandby {
+			p.decrementStandby()
+			// Signal to replenish immediately if it was a standby tunnel
+			select {
+			case p.replenishChan <- struct{}{}:
+			default:
+			}
+		} else {
+			p.decrementActive()
+		}
 	}()
 
 	// Build server URL
@@ -196,7 +216,8 @@ func (p *ConnectionPool) handleTunnel(tunnel *Tunnel) {
 	log.Debug("Magic signal received, connecting to local service", "tunnel_id", tunnel.id)
 
 	// Move this tunnel from standby to active
-	p.moveToActive(tunnel)
+	p.moveToActive()
+	isStandby = false
 	
 	// Immediately trigger replenishment to create a new standby tunnel
 	select {
@@ -319,41 +340,6 @@ func (p *ConnectionPool) handleTunnel(tunnel *Tunnel) {
 	log.Debug("Tunnel handler finished", "tunnel_id", tunnel.id)
 }
 
-func (p *ConnectionPool) removeTunnel(tunnel *Tunnel) {
-	p.mu.Lock()
-	
-	// Try to remove from standby tunnels
-	found := false
-	for i, t := range p.standbyTunnels {
-		if t.id == tunnel.id {
-			p.standbyTunnels = append(p.standbyTunnels[:i], p.standbyTunnels[i+1:]...)
-			found = true
-			break
-		}
-	}
-	
-	// If not in standby, remove from active tunnels
-	if !found {
-		for i, t := range p.activeTunnels {
-			if t.id == tunnel.id {
-				p.activeTunnels = append(p.activeTunnels[:i], p.activeTunnels[i+1:]...)
-				break
-			}
-		}
-	}
-	
-	p.mu.Unlock()
-	
-	log.Debug("Tunnel removed from pool", "tunnel_id", tunnel.id, "was_standby", found)
-	
-	// Signal to replenish immediately if it was a standby tunnel
-	if found {
-		select {
-		case p.replenishChan <- struct{}{}:
-		default:
-		}
-	}
-}
 
 func (p *ConnectionPool) maintain() {
 	ticker := time.NewTicker(5 * time.Second)
@@ -375,8 +361,8 @@ func (p *ConnectionPool) maintain() {
 
 func (p *ConnectionPool) replenishPool() {
 	p.mu.Lock()
-	standbyCount := len(p.standbyTunnels)
-	activeCount := len(p.activeTunnels)
+	standbyCount := p.standbyCount
+	activeCount := p.activeCount
 	p.mu.Unlock()
 
 	needed := p.cfg.PoolSize - standbyCount
