@@ -24,7 +24,7 @@ type LogConfig struct {
 }
 
 type ClientTransportConfig struct {
-	Protocol   string `json:"protocol,omitempty"`    // "quic" or "tcp"
+	Protocol   string `json:"protocol,omitempty"`    // "quic", "tcp", "ws", or "wss"
 	IP         string `json:"server_ip,omitempty"`   // Server IP
 	Port       int    `json:"server_port,omitempty"` // Server Port
 	CAFile     string `json:"ca_file,omitempty"`     // Path to CA file
@@ -32,7 +32,7 @@ type ClientTransportConfig struct {
 }
 
 type ServerTransportConfig struct {
-	Protocol string `json:"protocol,omitempty"`  // "quic" or "tcp"
+	Protocol string `json:"protocol,omitempty"`  // "quic", "tcp", or "ws"
 	Port     int    `json:"port,omitempty"`      // Server Port
 	CertFile string `json:"cert_file,omitempty"` // Path to certificate file
 	KeyFile  string `json:"key_file,omitempty"`  // Path to key file

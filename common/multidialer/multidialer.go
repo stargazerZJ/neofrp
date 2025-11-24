@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/log"
+	"github.com/gorilla/websocket"
 	"github.com/quic-go/quic-go"
 )
 
@@ -59,6 +61,20 @@ func Dial(ctx context.Context, protocol, address string, tlsConfig *tls.Config) 
 			return nil, err
 		}
 		return NewTCPSession(conn, true), nil // isClient = true
+	case "ws", "wss":
+		scheme := "ws"
+		if protocol == "wss" {
+			scheme = "wss"
+		}
+		u := fmt.Sprintf("%s://%s/ws", scheme, address)
+		dialer := websocket.Dialer{
+			TLSClientConfig: tlsConfig,
+		}
+		c, _, err := dialer.DialContext(ctx, u, nil)
+		if err != nil {
+			return nil, err
+		}
+		return NewTCPSession(NewWSConn(c), true), nil
 	case "quic":
 		qcfg := &quic.Config{
 			// Increase flow control windows to allow high throughput on high BDP paths / loopback.
@@ -93,6 +109,18 @@ func Listen(ctx context.Context, protocol, address string, tlsConfig *tls.Config
 			return nil, err
 		}
 		return &tcpListener{Listener: l}, nil
+	case "ws":
+		// For WS, we start a simple HTTP server that upgrades connections
+		l, err := net.Listen("tcp", address)
+		if err != nil {
+			return nil, err
+		}
+		wl := &wsListener{
+			Listener: l,
+			conns:    make(chan net.Conn, 128),
+		}
+		go wl.serve()
+		return wl, nil
 	case "quic":
 		qcfg := &quic.Config{
 			InitialStreamReceiveWindow:     6 * 1024 * 1024,
@@ -605,3 +633,78 @@ func (sc *sessionConn) Close() error {
 func (sc *sessionConn) SetDeadline(t time.Time) error      { return nil }
 func (sc *sessionConn) SetReadDeadline(t time.Time) error  { return nil }
 func (sc *sessionConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// --- WebSocket Implementation ---
+
+// WSConn adapts a websocket.Conn to net.Conn
+type WSConn struct {
+	*websocket.Conn
+	reader io.Reader
+}
+
+func NewWSConn(c *websocket.Conn) *WSConn {
+	return &WSConn{Conn: c}
+}
+
+func (c *WSConn) Read(b []byte) (n int, err error) {
+	if c.reader == nil {
+		_, c.reader, err = c.Conn.NextReader()
+		if err != nil {
+			return 0, err
+		}
+	}
+	n, err = c.reader.Read(b)
+	if err == io.EOF {
+		c.reader = nil
+		return c.Read(b)
+	}
+	return n, err
+}
+
+func (c *WSConn) Write(b []byte) (n int, err error) {
+	err = c.Conn.WriteMessage(websocket.BinaryMessage, b)
+	if err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func (c *WSConn) SetDeadline(t time.Time) error {
+	if err := c.Conn.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return c.Conn.SetWriteDeadline(t)
+}
+
+// wsListener implements SessionListener for WebSocket
+type wsListener struct {
+	net.Listener
+	conns chan net.Conn
+}
+
+func (l *wsListener) serve() {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+	http.Serve(l.Listener, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Errorf("upgrade failed: %v", err)
+			return
+		}
+		l.conns <- NewWSConn(c)
+	}))
+}
+
+func (l *wsListener) AcceptSession() (Session, error) {
+	conn := <-l.conns
+	return NewTCPSession(conn, false), nil
+}
+
+func (l *wsListener) Accept() (net.Conn, error) {
+	session, err := l.AcceptSession()
+	if err != nil {
+		return nil, err
+	}
+	return &sessionConn{Session: session}, nil
+}

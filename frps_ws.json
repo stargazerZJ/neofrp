@@ -1,0 +1,17 @@
+{
+    "recognized_tokens": [
+        "123456"
+    ],
+    "transport": {
+        "protocol": "ws",
+        "port": 7000
+    },
+    "connections": {
+        "tcp_ports": [
+            7001
+        ]
+    },
+    "log": {
+        "log_level": "debug"
+    }
+}
