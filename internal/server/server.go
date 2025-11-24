@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -16,10 +17,12 @@ import (
 )
 
 type Server struct {
-	cfg      *config.ServerConfig
-	upgrader websocket.Upgrader
-	pools    map[int]*ConnectionPool
-	mu       sync.RWMutex
+	cfg        *config.ServerConfig
+	upgrader   websocket.Upgrader
+	pools      map[int]*ConnectionPool
+	mu         sync.RWMutex
+	httpServer *http.Server
+	shutdown   chan struct{}
 }
 
 type ConnectionPool struct {
@@ -36,7 +39,8 @@ func NewServer(cfg *config.ServerConfig) *Server {
 				return true
 			},
 		},
-		pools: make(map[int]*ConnectionPool),
+		pools:    make(map[int]*ConnectionPool),
+		shutdown: make(chan struct{}),
 	}
 }
 
@@ -44,9 +48,55 @@ func (s *Server) Start() error {
 	addr := fmt.Sprintf("%s:%d", s.cfg.BindAddr, s.cfg.BindPort)
 	log.Info("Starting FRP server", "addr", addr)
 
-	http.HandleFunc("/ws", s.handleWebSocket)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", s.handleWebSocket)
+	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/shutdown", s.handleShutdown)
 
-	return http.ListenAndServe(addr, nil)
+	s.httpServer = &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+
+	// Start server in a goroutine
+	errChan := make(chan error, 1)
+	go func() {
+		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errChan <- err
+		}
+	}()
+
+	// Wait for shutdown signal or error
+	select {
+	case err := <-errChan:
+		return err
+	case <-s.shutdown:
+		log.Info("Shutdown signal received, stopping server...")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return s.httpServer.Shutdown(ctx)
+	}
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("ok"))
+}
+
+func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
+	log.Info("Shutdown requested via HTTP endpoint")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Shutting down..."))
+	
+	// Trigger shutdown in a goroutine to allow response to be sent
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		close(s.shutdown)
+		// Give the server time to shutdown gracefully, then force exit
+		time.Sleep(6 * time.Second)
+		log.Warn("Forcing exit after shutdown timeout")
+		os.Exit(0)
+	}()
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
