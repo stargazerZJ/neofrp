@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"neofrp/internal/config"
+	"neofrp/internal/protocol"
 
 	"github.com/charmbracelet/log"
 )
@@ -298,6 +299,16 @@ func (s *Server) startTCPListener(pool *ConnectionPool) {
 		// Get a tunnel from the pool
 		select {
 		case tunnel := <-pool.tunnels:
+			// Send magic signal to inform client to dial local connection
+			select {
+			case tunnel.uploadChan <- protocol.MagicSignal:
+				log.Debug("Magic signal sent to client", "tunnel_id", tunnel.id)
+			case <-time.After(2 * time.Second):
+				log.Warn("Failed to send magic signal, closing connection", "tunnel_id", tunnel.id)
+				tcpConn.Close()
+				tunnel.cancel()
+				continue
+			}
 			go s.handleTCPConnection(tcpConn, tunnel)
 		case <-time.After(5 * time.Second):
 			log.Warn("No tunnel available in pool", "port", pool.port)

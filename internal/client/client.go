@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"neofrp/internal/config"
+	"neofrp/internal/protocol"
 
 	"github.com/charmbracelet/log"
 )
@@ -158,6 +159,21 @@ func (p *ConnectionPool) handleTunnel(tunnel *Tunnel) {
 	}
 
 	log.Info("Download stream established", "tunnel_id", tunnel.id)
+
+	// Wait for magic signal before connecting to local service
+	magicBuf := make([]byte, len(protocol.MagicSignal))
+	n, err := io.ReadFull(resp.Body, magicBuf)
+	if err != nil {
+		log.Error("Failed to read magic signal", "error", err, "tunnel_id", tunnel.id)
+		return
+	}
+	
+	if n != len(protocol.MagicSignal) || !bytes.Equal(magicBuf, protocol.MagicSignal) {
+		log.Error("Invalid magic signal received", "tunnel_id", tunnel.id)
+		return
+	}
+	
+	log.Debug("Magic signal received, connecting to local service", "tunnel_id", tunnel.id)
 
 	// Connect to local service
 	localAddr := fmt.Sprintf("%s:%d", tunnel.cfg.LocalAddr, tunnel.cfg.LocalPort)
