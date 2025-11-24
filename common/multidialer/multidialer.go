@@ -560,18 +560,22 @@ type tcpListener struct {
 }
 // --- WebSocket Implementation ---
 
-// wsConn wraps a websocket.Conn to implement io.ReadWriteCloser
+// wsConn wraps a websocket.Conn to implement io.ReadWriteCloser and net.Conn
 type wsConn struct {
-	conn *websocket.Conn
-	mu   sync.Mutex
-	buf  []byte
+	conn       *websocket.Conn
+	mu         sync.Mutex
+	buf        []byte
+	remoteAddr net.Addr
+	localAddr  net.Addr
 }
 
 
 func newWSConn(conn *websocket.Conn) *wsConn {
 	return &wsConn{
-		conn: conn,
-		buf:  make([]byte, 0),
+		conn:       conn,
+		buf:        make([]byte, 0),
+		remoteAddr: conn.RemoteAddr(),
+		localAddr:  conn.LocalAddr(),
 	}
 }
 
@@ -616,8 +620,68 @@ func (w *wsConn) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
+// ReadFrom implements io.ReaderFrom to handle net.Buffers.WriteTo efficiently
+// This ensures that when writeFrame uses net.Buffers, the entire frame (header+payload)
+// is sent as a single WebSocket message
+func (w *wsConn) ReadFrom(r io.Reader) (n int64, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// Read all data from r into a buffer
+	buf := make([]byte, 0, 65539) // header(4) + max payload(65535)
+	tempBuf := make([]byte, 65539)
+	
+	for {
+		nr, er := r.Read(tempBuf)
+		if nr > 0 {
+			buf = append(buf, tempBuf[:nr]...)
+		}
+		if er != nil {
+			if er != io.EOF {
+				return int64(len(buf)), er
+			}
+			break
+		}
+	}
+	
+	// Send as single WebSocket message
+	if len(buf) > 0 {
+		err = w.conn.WriteMessage(websocket.BinaryMessage, buf)
+		if err != nil {
+			return 0, err
+		}
+	}
+	
+	return int64(len(buf)), nil
+}
+
 func (w *wsConn) Close() error {
+	// Send close message before closing (ignore errors as connection might already be closing)
+	w.conn.WriteControl(websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+		time.Now().Add(time.Second))
 	return w.conn.Close()
+}
+
+// Implement net.Conn interface methods for compatibility
+func (w *wsConn) SetDeadline(t time.Time) error {
+	return w.conn.SetReadDeadline(t) // WebSocket doesn't have SetDeadline, use read deadline
+}
+
+func (w *wsConn) SetReadDeadline(t time.Time) error {
+	return w.conn.SetReadDeadline(t)
+}
+
+func (w *wsConn) SetWriteDeadline(t time.Time) error {
+	return w.conn.SetWriteDeadline(t)
+}
+
+func (w *wsConn) RemoteAddr() net.Addr {
+	return w.remoteAddr
+}
+
+func (w *wsConn) LocalAddr() net.Addr {
+	return w.localAddr
 }
 
 // NewWebSocketSession creates a new session over a WebSocket connection
