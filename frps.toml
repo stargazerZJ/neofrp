@@ -1,0 +1,14 @@
+# FRP Server Configuration
+
+# Server bind address
+bind_addr = "0.0.0.0"
+
+# Server bind port (WebSocket port)
+bind_port = 7000
+
+# Authorization key (must match client)
+# This key is sent in the Authorization: Bearer header
+auth_key = "your-secret-key-here"
+
+# Log level: debug, info, warn, error
+log_level = "info"

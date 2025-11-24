@@ -1,0 +1,8 @@
+# Example Server Configuration for SSH Forwarding
+# This configuration sets up the server to accept WebSocket connections
+# and forward them to TCP port 6000
+
+bind_addr = "0.0.0.0"
+bind_port = 7000
+auth_key = "example-key-change-in-production"
+log_level = "info"

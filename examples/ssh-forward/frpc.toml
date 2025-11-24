@@ -1,0 +1,12 @@
+# Example Client Configuration for SSH Forwarding
+# This configuration connects to the server and forwards local SSH (port 22)
+# to remote port 6000
+
+server_addr = "localhost"
+server_port = 7000
+auth_key = "example-key-change-in-production"
+local_addr = "127.0.0.1"
+local_port = 22
+remote_port = 6000
+pool_size = 5
+log_level = "info"

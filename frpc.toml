@@ -1,0 +1,26 @@
+# FRP Client Configuration
+
+# Server address (can be domain name or IP)
+server_addr = "your-server.com"
+
+# Server port (WebSocket port, use 443 for WSS)
+server_port = 443
+
+# Authorization key (must match server)
+# This key is sent in the Authorization: Bearer header
+auth_key = "your-secret-key-here"
+
+# Local service address to forward
+local_addr = "127.0.0.1"
+
+# Local service port to forward
+local_port = 22
+
+# Remote port on server to expose
+remote_port = 6000
+
+# Connection pool size (number of WebSocket connections to maintain)
+pool_size = 5
+
+# Log level: debug, info, warn, error
+log_level = "info"
