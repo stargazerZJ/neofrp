@@ -68,7 +68,10 @@ func Dial(ctx context.Context, protocol, address string, tlsConfig *tls.Config, 
 		}
 		u := fmt.Sprintf("%s://%s/ws", scheme, address)
 		dialer := websocket.Dialer{
-			TLSClientConfig: tlsConfig,
+			TLSClientConfig:  tlsConfig,
+			HandshakeTimeout: 30 * time.Second,
+			// Enable compression for better performance over slow links
+			EnableCompression: false, // Disable for now to avoid issues with reverse proxies
 		}
 		// Add Authorization header if bearer token is provided
 		var headers http.Header
@@ -80,7 +83,10 @@ func Dial(ctx context.Context, protocol, address string, tlsConfig *tls.Config, 
 		if err != nil {
 			return nil, err
 		}
-		return NewTCPSession(NewWSConn(c), true), nil
+		wsConn := NewWSConn(c)
+		// Start keep-alive pinger for client connections
+		go wsConn.keepAlive(ctx)
+		return NewTCPSession(wsConn, true), nil
 	case "quic":
 		qcfg := &quic.Config{
 			// Increase flow control windows to allow high throughput on high BDP paths / loopback.
@@ -649,22 +655,41 @@ type WSConn struct {
 }
 
 func NewWSConn(c *websocket.Conn) *WSConn {
+	// Enable automatic pong responses to ping frames
+	c.SetPingHandler(func(appData string) error {
+		return c.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(time.Second))
+	})
+	
+	// Set pong handler (optional, for logging)
+	c.SetPongHandler(func(appData string) error {
+		log.Debugf("Received pong from %s", c.RemoteAddr())
+		return nil
+	})
+	
 	return &WSConn{Conn: c}
 }
 
 func (c *WSConn) Read(b []byte) (n int, err error) {
-	if c.reader == nil {
-		_, c.reader, err = c.Conn.NextReader()
-		if err != nil {
-			return 0, err
+	for {
+		if c.reader == nil {
+			var messageType int
+			messageType, c.reader, err = c.Conn.NextReader()
+			if err != nil {
+				return 0, err
+			}
+			// Skip non-binary messages (text, ping, pong are handled by handlers)
+			if messageType != websocket.BinaryMessage {
+				c.reader = nil
+				continue
+			}
 		}
+		n, err = c.reader.Read(b)
+		if err == io.EOF {
+			c.reader = nil
+			continue
+		}
+		return n, err
 	}
-	n, err = c.reader.Read(b)
-	if err == io.EOF {
-		c.reader = nil
-		return c.Read(b)
-	}
-	return n, err
 }
 
 func (c *WSConn) Write(b []byte) (n int, err error) {
@@ -680,6 +705,25 @@ func (c *WSConn) SetDeadline(t time.Time) error {
 		return err
 	}
 	return c.Conn.SetWriteDeadline(t)
+}
+
+// keepAlive sends periodic ping messages to keep the connection alive through proxies
+func (c *WSConn) keepAlive(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := c.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(5*time.Second)); err != nil {
+				log.Debugf("Failed to send ping: %v", err)
+				return
+			}
+			log.Debugf("Sent ping to %s", c.RemoteAddr())
+		}
+	}
 }
 
 // wsListener implements SessionListener for WebSocket
